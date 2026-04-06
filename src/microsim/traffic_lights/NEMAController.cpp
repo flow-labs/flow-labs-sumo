@@ -50,6 +50,7 @@
 // #define DEBUG_NEMA
 // #define FUZZ_TESTING
 // #define DEBUG_NEMA_SWITCH
+// #define DEBUG_NEMA_TIMING
 
 // ===========================================================================
 // method definitions
@@ -931,18 +932,18 @@ NEMALogic::calculateForceOffsTS2() {
     // We can find this "0" point by first constructing the forceOffs in sequential order via the 170 method
     calculateForceOffs170();
 
-    // Switch the Force Off Times to align with TS2 Cycle, which is the *start* of the earliest coordinated phase
-    // The coordinate phases will always be the defaultBarrierPhases[i][0]
-    SUMOTime minCoordTime = MIN2(coordinatePhaseObjs[0]->forceOffTime - coordinatePhaseObjs[0]->maxDuration,
-                                 coordinatePhaseObjs[1]->forceOffTime - coordinatePhaseObjs[1]->maxDuration);
+    // Switch the Force Off Times to align with TS2 Cycle, which is the *start* of the earliest coordinated phase.
+    // The start of a coordinated phase = forceOff - maxDuration.
+    // In lead-lag configurations the coord phase on the lead ring has its forceOff
+    // near the cycle boundary, so forceOff - maxDuration can wrap negative.
+    // ModeCycle is required to handle this wrap-around correctly.
+    SUMOTime coord0Start = ModeCycle(coordinatePhaseObjs[0]->forceOffTime - coordinatePhaseObjs[0]->maxDuration, myCycleLength);
+    SUMOTime coord1Start = ModeCycle(coordinatePhaseObjs[1]->forceOffTime - coordinatePhaseObjs[1]->maxDuration, myCycleLength);
+    SUMOTime minCoordTime = MIN2(coord0Start, coord1Start);
 
     // loop through all the phases and subtract this minCoordTime to move the 0 point to the start of the first coordinated phase
     for (auto& p : myPhaseObjs) {
-        if ((p->forceOffTime - minCoordTime) >= 0) {
-            p->forceOffTime -= (minCoordTime);
-        } else {
-            p->forceOffTime = (myCycleLength + (p->forceOffTime - (minCoordTime)));
-        }
+        p->forceOffTime = ModeCycle(p->forceOffTime - minCoordTime, myCycleLength);
         p->greatestStartTime = ModeCycle(p->greatestStartTime - minCoordTime, myCycleLength);
     }
 }
@@ -967,7 +968,16 @@ NEMALogic::calculateInitialPhases170() {
             // If it should have happened and it's not to the start time of me yet, start in my phase ( will have to be in my phase longer than max time likely )
             SUMOTime syntheticPriorStart = p->getSequentialPriorPhase()->greatestStartTime < p->greatestStartTime ?
                                            p->getSequentialPriorPhase()->greatestStartTime : p->getSequentialPriorPhase()->greatestStartTime - myCycleLength;
-            if (cycleTime <= ModeCycle(p->greatestStartTime, myCycleLength) && cycleTime > ModeCycle(syntheticPriorStart, myCycleLength)) {
+            // FIX: Do NOT apply ModeCycle to syntheticPriorStart. The synthetic value
+            // is intentionally negative for the wrap-around case (prior phase is at the
+            // end of the cycle, current phase is at the beginning). ModeCycle would undo
+            // this adjustment, wrapping it back to a large positive value and making the
+            // comparison "cycleTime > wrappedValue" fail at cycleTime=0.
+            // Example: Phase 2 at cycle start has greatestStartTime=20, prior Phase 4
+            // has greatestStartTime=75. syntheticPriorStart = 75-85 = -10.
+            // Without fix: ModeCycle(-10, 85)=75, and 0 > 75 fails.
+            // With fix: 0 > -10 succeeds correctly.
+            if (cycleTime <= ModeCycle(p->greatestStartTime, myCycleLength) && cycleTime > syntheticPriorStart) {
                 found = true;
                 activePhases[i] = p;
                 break;
@@ -979,8 +989,13 @@ NEMALogic::calculateInitialPhases170() {
             WRITE_WARNING(error);
             WRITE_WARNING(TL("I am starting in the coordinated phases"));
 #endif
-            activePhases[0] = defaultBarrierPhases[0][0];
-            activePhases[1] = defaultBarrierPhases[1][0];
+            // FIX: Fall back to the coordinated phases, not the barrier phases.
+            // In lead-lag configs, barrierPhases differ from coordinatePhases
+            // (e.g. barrierPhases="1,6" vs coordinatePhases="2,6"), and the
+            // coordinated phase is the correct default start position.
+            // In standard configs these are the same phase, so no change.
+            activePhases[0] = coordinatePhaseObjs[0];
+            activePhases[1] = coordinatePhaseObjs[1];
         }
     }
 
@@ -1447,6 +1462,18 @@ NEMAPhase::enter(NEMALogic* controller, NEMAPhase* lastPhase) {
     if (maxRecall && !coordinatePhase) {
         myExpectedDuration = maxGreenDynamic;
     }
+#ifdef DEBUG_NEMA_TIMING
+    if (coordinatePhase) {
+        std::cout << SIMTIME << " Phase " << phaseName
+                  << " ENTER (coord): cycleTime=" << STEPS2TIME(controller->getTimeInCycle())
+                  << " forceOff=" << STEPS2TIME(forceOffTime)
+                  << " maxDur=" << STEPS2TIME(maxDuration)
+                  << " maxGreenDyn=" << STEPS2TIME(maxGreenDynamic)
+                  << " expectedDur=" << STEPS2TIME(myExpectedDuration)
+                  << " state=" << (int)myLightState
+                  << std::endl;
+    }
+#endif
     // Set the controller's active phase
     controller->setActivePhase(this);
 }
@@ -1578,6 +1605,17 @@ NEMAPhase::update(NEMALogic* controller) {
                     && p->callActive()) {
                 greenRestTimer -= DELTA_T;
                 vehicleActive = true;
+#ifdef DEBUG_NEMA_TIMING
+                if (coordinatePhase) {
+                    std::cout << SIMTIME << " Phase " << phaseName
+                              << " GREEN_REST_DEMAND (coord): detected on phase " << p->phaseName
+                              << " greenRestTimer=" << STEPS2TIME(greenRestTimer)
+                              << " maxDur=" << STEPS2TIME(maxDuration)
+                              << " cycleTime=" << STEPS2TIME(controller->getTimeInCycle())
+                              << " forceOff=" << STEPS2TIME(forceOffTime)
+                              << std::endl;
+                }
+#endif
                 break;
             }
         }
@@ -1599,6 +1637,15 @@ NEMAPhase::update(NEMALogic* controller) {
         // if the green rest timer is exhausted, set ready to switch
         if (greenRestTimer < DELTA_T) {
             readyToSwitch = true;
+#ifdef DEBUG_NEMA_TIMING
+            if (coordinatePhase) {
+                std::cout << SIMTIME << " Phase " << phaseName
+                          << " GREEN_REST_EXHAUSTED (coord): greenRestTimer=" << STEPS2TIME(greenRestTimer)
+                          << " cycleTime=" << STEPS2TIME(controller->getTimeInCycle())
+                          << " forceOff=" << STEPS2TIME(forceOffTime)
+                          << std::endl;
+            }
+#endif
             // force the counterpart to be ready to switch too. This needs to be latching....
             NEMAPhase* otherPhase = controller->getOtherPhase(this);
             if (otherPhase->getCurrentState() > LightState::Green) {
@@ -1616,6 +1663,17 @@ NEMAPhase::update(NEMALogic* controller) {
     }
     // Check to see if a switch is desired
     if (duration >= myExpectedDuration) {
+#ifdef DEBUG_NEMA_TIMING
+        if (coordinatePhase) {
+            std::cout << SIMTIME << " Phase " << phaseName
+                      << " READY_TO_SWITCH (coord): dur=" << STEPS2TIME(duration)
+                      << " expectedDur=" << STEPS2TIME(myExpectedDuration)
+                      << " cycleTime=" << STEPS2TIME(controller->getTimeInCycle())
+                      << " forceOff=" << STEPS2TIME(forceOffTime)
+                      << " state=" << (int)myLightState
+                      << std::endl;
+        }
+#endif
         readyToSwitch = true;
     }
 }
@@ -1710,6 +1768,12 @@ PhaseTransitionLogic::okay(NEMALogic* controller) {
                 // Check if any other phase on the same ring and barrier has demand
                 for (auto& p : controller->getPhasesByRing(fromPhase->ringNum)) {
                     if (p != fromPhase && p->barrierNum == fromPhase->barrierNum && p->callActive()) {
+#ifdef DEBUG_NEMA_TIMING
+                        std::cout << SIMTIME << " Phase " << fromPhase->phaseName
+                                  << " SELF-TRANSITION BLOCKED (coord lead-lag): demand on phase "
+                                  << p->phaseName << " same barrier side"
+                                  << std::endl;
+#endif
                         return false;
                     }
                 }
@@ -1776,6 +1840,47 @@ PhaseTransitionLogic::coordBase(NEMALogic* controller) {
 
 bool
 PhaseTransitionLogic::fromBarrier(NEMALogic* controller) {
+    // FIX: In coordinate mode, allow transitions to the coordinated phase
+    // without requiring detector demand, because the coordinated phase is
+    // the timing anchor and must never be skipped.
+    //
+    // Two cases must be distinguished:
+    //
+    // (a) Cross-barrier transition to the coord phase (e.g. sidestreet barrier
+    //     phase 4 -> coord phase 2). This is allowed whenever both rings are
+    //     ready to switch, mirroring the exemption in coordBase().
+    //
+    // (b) Same-barrier wrap-back to the coord phase (e.g. lead-lag barrier
+    //     phase 1 -> coord phase 2). This should ONLY be allowed when there
+    //     is no demand on the other side of the barrier. If sidestreet demand
+    //     exists, the barrier phase must NOT wrap back — it should instead
+    //     self-transition into green transfer and wait for the other ring's
+    //     coordinated phase to reach its force-off, enabling a synchronized
+    //     barrier cross.
+    if (controller->coordinateMode && toPhase->coordinatePhase && fromPhase->readyToSwitch) {
+        if (fromPhase->barrierNum != toPhase->barrierNum) {
+            // Case (a): cross-barrier to coord phase — allow if other ring is also ready
+            if (controller->getOtherPhase(fromPhase)->readyToSwitch) {
+                return true;
+            }
+        } else {
+            // Case (b): same-barrier wrap to coord phase — only if no cross-barrier demand
+            bool crossBarrierDemand = false;
+            for (auto& p : controller->getPhaseObjs()) {
+                if (p->barrierNum != fromPhase->barrierNum && p->callActive()) {
+                    crossBarrierDemand = true;
+                    break;
+                }
+            }
+            if (!crossBarrierDemand) {
+                return true;
+            }
+            // If there IS cross-barrier demand, fall through. The self-transition
+            // will be selected instead, putting this phase into green transfer
+            // until the other ring is ready for the barrier cross.
+        }
+    }
+
     if (freeBase(controller)) {
         if (fromPhase->barrierNum == toPhase->barrierNum) {
             // same barrier side so we are good.
@@ -1803,12 +1908,19 @@ bool
 PhaseTransitionLogic::fromCoord(NEMALogic* controller) {
     if (coordBase(controller)) {
         // In lead-lag, the coordinated phase may not be at the barrier.
-        // If transitioning within the same barrier section (not a barrier cross),
+        // If transitioning within the same barrier section (not a barrier cross)
+        // AND the coordinated phase is not at the barrier (lead-lag only),
         // the other ring's phase does not need to be ready.
+        // IMPORTANT: This exemption must NOT apply when the coordinated phase IS
+        // at the barrier (standard config), otherwise the coord phase can
+        // incorrectly transition to earlier phases on the same barrier side
+        // (e.g. phase 6 -> phase 5) when the other ring isn't ready, causing
+        // the coordinated phase to be skipped.
         bool sameBarrier = (fromPhase->barrierNum == toPhase->barrierNum);
+        bool sameBarrierLeadLag = sameBarrier && !fromPhase->isAtBarrier;
         bool otherPhaseReady = controller->getOtherPhase(fromPhase)->readyToSwitch;
 
-        if (sameBarrier || otherPhaseReady) {
+        if (sameBarrierLeadLag || otherPhaseReady) {
             // Dr. Wang had the Type-170 code setup in a way that it could transition whenever - meaning that it didn't matter if the prior phase could fit or not
             if (controller->isType170()) {
                 return true;
@@ -1819,16 +1931,24 @@ PhaseTransitionLogic::fromCoord(NEMALogic* controller) {
             }
             // now determine if there my prior phase can fit or not. We already know that I can fit.
             NEMAPhase* priorPhase = toPhase->getSequentialPriorPhase();
-            // In lead-lag, priorPhase of the lag phase (e.g. Phase 1) is the coord phase itself (Phase 2).
-            // The prior-phase-fit check is meant for phases BEFORE the toPhase, but when
-            // that's the fromPhase itself, the check is self-referential. Skip it.
-            if (priorPhase == fromPhase) {
-                return true;
-            }
             SUMOTime timeTillForceOff = controller->ModeCycle(priorPhase->forceOffTime - controller->getTimeInCycle(), controller->getCurrentCycleLength());
             SUMOTime transitionTime = fromPhase->getTransitionTime(controller);
             // if the time till the force off is less than the min duration ||
             // if it is greater than the cycle length minus the length of the coordinate phase (which the fromPhase automatically is)
+#ifdef DEBUG_NEMA_TIMING
+            std::cout << SIMTIME << " fromCoord " << fromPhase->phaseName << "->" << toPhase->phaseName
+                      << ": priorPhase=" << priorPhase->phaseName
+                      << " timeTillForceOff=" << STEPS2TIME(timeTillForceOff)
+                      << " priorMinDur=" << STEPS2TIME(priorPhase->minDuration)
+                      << " transTime=" << STEPS2TIME(transitionTime)
+                      << " cycleTime=" << STEPS2TIME(controller->getTimeInCycle())
+                      << " priorForceOff=" << STEPS2TIME(priorPhase->forceOffTime)
+                      << " cycleLenMinusCoord=" << STEPS2TIME(controller->getCurrentCycleLength() - fromPhase->minDuration)
+                      << " check1=" << ((priorPhase->minDuration + transitionTime) > timeTillForceOff)
+                      << " check2=" << (timeTillForceOff > (controller->getCurrentCycleLength() - fromPhase->minDuration))
+                      << " -> " << (((priorPhase->minDuration + transitionTime) > timeTillForceOff || timeTillForceOff > (controller->getCurrentCycleLength() - fromPhase->minDuration)) ? "ALLOW" : "BLOCK")
+                      << std::endl;
+#endif
             if ((priorPhase->minDuration + transitionTime) > timeTillForceOff || timeTillForceOff > (controller->getCurrentCycleLength() - fromPhase->minDuration)) {
                 return true;
             }
